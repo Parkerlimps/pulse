@@ -428,7 +428,10 @@ void enterMini(HWND hwnd) {
 
     ShowWindow(hwnd, SW_RESTORE);
     SetWindowLongPtrW(hwnd, GWL_STYLE, WS_POPUP | WS_CLIPCHILDREN);
-    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, WS_EX_TOPMOST | WS_EX_TOOLWINDOW);
+    // 不能用 WS_EX_TOOLWINDOW：它会把窗口从任务栏和 Alt+Tab 里摘掉，而迷你条
+    // 一旦被别的窗口挡住或失焦，键盘 Esc/M 也收不到，程序就真的找不回来了。
+    // APPWINDOW 让任务栏按钮在迷你态也一直保留，随时能把小条叫回前台。
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, WS_EX_TOPMOST | WS_EX_APPWINDOW);
     SetWindowPos(hwnd, HWND_TOPMOST, sw - w - MulDiv(28, dpi, 96), sh - h - MulDiv(72, dpi, 96),
                  w, h, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
     g.mini = true;

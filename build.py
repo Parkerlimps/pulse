@@ -86,8 +86,13 @@ def build() -> None:
     run(cmd, "g++")
 
     DIST.mkdir(exist_ok=True)
-    shutil.copy2(BUILD / "Pulse.exe", DIST / "Pulse.exe")
     exe = DIST / "Pulse.exe"
+    if exe.exists():
+        # 旧版正开着时不能直接覆盖（WinError 32）；Windows 允许把运行中的 exe
+        # 改名挪开，旧进程继续跑不受影响。不要 unlink —— 某些环境会把删除代理成
+        # 「移到回收站」，对运行中的文件必然失败。挪到 build/ 下，不会进仓库。
+        exe.replace(BUILD / "Pulse.prev.exe")
+    shutil.copy2(BUILD / "Pulse.exe", exe)
     print(f"\n完成：{exe}  ({exe.stat().st_size / 1048576:.2f} MB)")
 
 
