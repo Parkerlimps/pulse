@@ -25,12 +25,14 @@ enum Act {
     A_PREV, A_PLAY, A_NEXT, A_MODE, A_MINI, A_RESTORE, A_CLOSE,
     A_ADD, A_RESCAN, A_ROW, A_DRAG,
     A_REMOVE_FOLDER, A_REMOVE_TRACK, A_RESTORE_TRACK, A_CLEAR_EXCLUDED,
+    A_DEV_PANEL, A_DEV_SELECT,
 };
 
 // 命中 id 分段：曲库行数不固定，删除按钮用远离 100+i 的段，避免大曲库撞号
 constexpr int ID_TRACK_DEL = 100000;
 constexpr int ID_FOLDER_DEL = 200000;
 constexpr int ID_RESTORE = 300000;
+constexpr int ID_DEV = 400000;
 
 struct Action {
     int act = A_NONE;
@@ -49,6 +51,9 @@ struct Model {
     std::string status;  // 出错时显示在副标题位置
     const std::vector<std::string>* folders = nullptr;   // 已添加的目录
     const std::vector<std::string>* excluded = nullptr;  // 已移除的曲目路径
+    const std::vector<std::string>* devices = nullptr;   // 可选输出端点
+    int devIndex = 0;
+    std::string deviceName;                              // 当前端点短名
 };
 
 static const D2D1_COLOR_F C_BG = D2D1::ColorF(0.043f, 0.047f, 0.063f);
@@ -108,6 +113,11 @@ public:
     void clearCover();
     void keepVisible(int row, int totalRows);
     int scroll() const { return (int)scroll_; }
+    bool closeDevicePanel() {
+        if (!devPanel_) return false;
+        devPanel_ = false;
+        return true;
+    }
 
 private:
     int hitTest(POINT p) const;
@@ -129,6 +139,7 @@ private:
     void paintMini(const Model& m);
     void paintTrackList(const Model& m, float top, float bottom);
     void paintFolderPanel(const Model& m, float top, float bottom);
+    void paintDevicePanel(const Model& m);
 
     HWND hwnd_ = nullptr;
     float dpi_ = 96.0f, W_ = 940, H_ = 640;
@@ -154,7 +165,8 @@ private:
     float pendingVol_ = -1;
     float scroll_ = 0;
     float panelScroll_ = 0;
-    bool panel_ = false;  // 文件夹管理面板是否展开
+    bool panel_ = false;     // 文件夹管理面板是否展开
+    bool devPanel_ = false;  // 输出设备浮层是否展开
     int lastTotal_ = 0;
     std::vector<Action> actions_;
     std::vector<std::pair<int, D2D1_RECT_F>> hots_;
@@ -451,7 +463,9 @@ inline void View::paintFull(const Model& m) {
     text(cur ? w(cur->title) : L"还没有在播放", fTitle_, titleR, C_TEXT);
     std::wstring sub = cur ? (w(cur->artist).empty() ? L"未知歌手" : w(cur->artist)) : L"从下面的曲库里选一首";
     if (cur && !cur->album.empty()) sub += L" · " + w(cur->album);
-    text(sub, fSub_, D2D1::RectF(mx, 60, W_ - 26, 82), C_MUTED);
+    // 错误信息优先占副标题位：原来画在 H_-3 到 H_+12，基本在窗口外，等于没提示
+    text(m.status.empty() ? sub : w(m.status), fSub_, D2D1::RectF(mx, 60, W_ - 26, 82),
+         m.status.empty() ? C_MUTED : C_ACCENT);
 
     // 频谱
     if (m.spec) spectrum(*m.spec, D2D1::RectF(mx, 96, W_ - 26, 160), 52, m.playing);
@@ -530,6 +544,14 @@ inline void View::paintFull(const Model& m) {
          DWRITE_TEXT_ALIGNMENT_CENTER);
     addHot(4, modeB);
 
+    // 输出端点：点开浮层选设备
+    rx -= 54 + 16;
+    D2D1_RECT_F devB = D2D1::RectF(rx - 148, cy + 3, rx, cy + 31);
+    if (hover_ == 14 || devPanel_) fillRound(devB, 8, D2D1::ColorF(1, 1, 1, 0.06f));
+    text(w(m.deviceName), fBtn_, devB, (hover_ == 14 || devPanel_) ? C_TEXT : C_MUTED,
+         DWRITE_TEXT_ALIGNMENT_CENTER);
+    addHot(14, devB);
+
     // 分隔线
     fill(D2D1::RectF(0, NOW_H - 1, W_, NOW_H), C_LINE);
 
@@ -561,8 +583,8 @@ inline void View::paintFull(const Model& m) {
     if (panel_) paintFolderPanel(m, listTop, listBottom);
     else paintTrackList(m, listTop, listBottom);
 
-    if (!m.status.empty())
-        text(w(m.status), fSmall_, D2D1::RectF(26, H_ - 3, W_ - 26, H_ + 12), C_ACCENT);
+    // 浮层必须最后画，命中测试又是从后往前找，这样才盖得住下面的控件
+    paintDevicePanel(m);
 }
 
 inline void View::paintTrackList(const Model& m, float listTop, float listBottom) {
@@ -727,6 +749,39 @@ inline void View::paintFolderPanel(const Model& m, float top, float bottom) {
     }
 }
 
+inline void View::paintDevicePanel(const Model& m) {
+    if (!devPanel_ || !m.devices) return;
+    const auto& devs = *m.devices;
+    const float rowH = 32.0f;
+    int n = (int)devs.size();
+    int maxRows = (int)((H_ - 16.0f - 248.0f) / rowH);
+    if (maxRows < 1) maxRows = 1;
+    if (n > maxRows) n = maxRows;
+
+    const float pw = 300.0f;
+    const float ph = 14.0f + n * rowH;
+    const float px = W_ - 26.0f - pw;
+    const float py = 248.0f;
+
+    fillRound(D2D1::RectF(px, py, px + pw, py + ph), 12, D2D1::ColorF(0.075f, 0.082f, 0.105f));
+    strokeRound(D2D1::RectF(px, py, px + pw, py + ph), 12, C_LINE, 1.0f);
+
+    for (int i = 0; i < n; i++) {
+        float y = py + 7.0f + i * rowH;
+        D2D1_RECT_F row = D2D1::RectF(px + 6, y, px + pw - 6, y + rowH - 2);
+        bool on = (i == m.devIndex);
+        bool hot = (hover_ == ID_DEV + i);
+        if (on) fillRound(row, 7, D2D1::ColorF(1.0f, 0.369f, 0.478f, 0.12f));
+        else if (hot) fillRound(row, 7, D2D1::ColorF(1, 1, 1, 0.04f));
+        text(w(devs[i]), fRowSub_, D2D1::RectF(px + 18, y, px + pw - 36, y + rowH - 2),
+             on ? C_ACCENT : C_TEXT);
+        if (on)
+            text(L"\u2713", fRow_, D2D1::RectF(px + pw - 34, y, px + pw - 12, y + rowH - 2),
+                 C_ACCENT, DWRITE_TEXT_ALIGNMENT_CENTER);
+        addHot(ID_DEV + i, row);
+    }
+}
+
 inline void View::paintMini(const Model& m) {
     const auto& tracks = *m.tracks;
     bool has = m.idx >= 0 && m.idx < (int)tracks.size();
@@ -772,7 +827,8 @@ inline void View::paintMini(const Model& m) {
     addHot(10, restore);
     addHot(11, close);
 
-    // 小窗也要能调音量：迷你窗是 TOOLWINDOW，常常拿不到键盘焦点，↑↓ 不一定管用
+    // 小窗也要能调音量：迷你态虽然保留了任务栏按钮（APPWINDOW），但经常失焦，
+    // ↑↓ 不一定送得到这里，所以给一条可点的滑条
     text(L"音量", fRowSub_, D2D1::RectF(72, 56, 108, 76), C_FAINT);
     D2D1_RECT_F volR = D2D1::RectF(112, 66, 300, 70);
     fillRound(volR, 2.0f, D2D1::ColorF(1, 1, 1, 0.08f));
@@ -822,6 +878,22 @@ inline void View::mouseDown(POINT p) {
     hover_ = id;
     float x = p.x * 96.0f / dpi_;
 
+    // 设备浮层开着时，点别处只关闭它，不触发底下的控件
+    if (devPanel_ && id != 14 && !(id >= ID_DEV && id < ID_DEV + 1000)) {
+        devPanel_ = false;
+        return;
+    }
+    if (id == 14) {
+        devPanel_ = !devPanel_;
+        if (devPanel_) actions_.push_back({A_DEV_PANEL, -1});
+        return;
+    }
+    if (id >= ID_DEV) {
+        actions_.push_back({A_DEV_SELECT, id - ID_DEV});
+        devPanel_ = false;
+        return;
+    }
+
     if (id == 7 || id == 5) {
         for (auto& hh : hots_) {
             if (hh.first != id) continue;
@@ -866,6 +938,7 @@ inline void View::mouseUp() {
 }
 
 inline void View::wheel(int delta) {
+    if (devPanel_) return;  // 浮层开着时别滚到底下的曲库
     float& s = panel_ ? panelScroll_ : scroll_;
     s -= delta / 120.0f * 58.0f;
     if (s < 0) s = 0;

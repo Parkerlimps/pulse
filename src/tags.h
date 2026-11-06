@@ -6,6 +6,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -127,8 +128,22 @@ inline Meta read(const std::string& path) {
     GetFileSizeEx(f, &sz);
     long long fileSize = sz.QuadPart;
 
-    std::vector<unsigned char> b((size_t)std::min<long long>(fileSize, 2 << 20));
+    // 先读文件头判断 ID3v2 的标签区有多长：封面动辄几 MB，死读 2 MB 会在
+    // 大 APIC 处断掉，后面的标题就读不到了。上限 16 MB，读到的都是标签区。
+    unsigned char hdr[10] = {};
     DWORD got = 0;
+    size_t head = (size_t)std::min<long long>(fileSize, 10);
+    ReadFile(f, hdr, (DWORD)head, &got, nullptr);
+    size_t want = 2 << 20;
+    if (got == 10 && memcmp(hdr, "ID3", 3) == 0) {
+        size_t tagSize = ss32(&hdr[6]);
+        want = 10 + tagSize;
+        if (want > (16u << 20)) want = 16u << 20;
+    }
+    want = (size_t)std::min<long long>((long long)want, fileSize);
+    std::vector<unsigned char> b(want);
+    SetFilePointer(f, 0, nullptr, FILE_BEGIN);
+    got = 0;
     ReadFile(f, b.data(), (DWORD)b.size(), &got, nullptr);
     b.resize(got);
     CloseHandle(f);

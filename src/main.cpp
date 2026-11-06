@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <string>
 #include <utility>
 #include <vector>
@@ -37,10 +38,16 @@ struct App {
     std::vector<std::string> folders;
     std::vector<std::string> excluded;  // 手动从曲库移除的文件（不删磁盘，可恢复）
     std::string dataDir, cfgPath, status, lastPath;
+    double statusAt = 0;  // status 最后一次设置的时间，用来做自动淡出
+    std::wstring devId;                 // 选中的输出端点，空 = 跟随系统默认
+    std::vector<std::wstring> devIds;   // 与 devNames 平行
+    std::vector<std::string> devNames;  // UTF-8，给 UI 用
+    int devIndex = 0;
     int idx = -1;
     int mode = 0;
     float vol = 0.7f;
     bool mini = false;
+    bool exclusive = false;
     bool playing = false;
     int coverIdx = -2;
     HWND hwnd = nullptr;
@@ -49,6 +56,12 @@ struct App {
 };
 
 App g;
+
+// 状态提示（切设备、独占切换、解码错误）统一走这里，4 秒后自动消失
+void setStatus(const std::string& s) {
+    g.status = s;
+    g.statusAt = util::nowSec();
+}
 
 // ---------------- 配置 ----------------
 
@@ -76,6 +89,8 @@ void loadConfig() {
         else if (k == "last") g.idx = atoi(v.c_str());
         else if (k == "lastpath") g.lastPath = util::normalizePath(v);
         else if (k == "mode") g.mode = atoi(v.c_str());
+        else if (k == "exclusive") g.exclusive = atoi(v.c_str()) != 0;
+        else if (k == "device") g.devId = util::widen(v);
         else if (k == "folder" && !v.empty()) {
             std::string d = util::normalizePath(v);
             bool dup = false;
@@ -104,6 +119,9 @@ void saveConfig() {
     s += buf;
     snprintf(buf, sizeof(buf), "mode=%d\n", g.mode);
     s += buf;
+    snprintf(buf, sizeof(buf), "exclusive=%d\n", g.exclusive ? 1 : 0);
+    s += buf;
+    if (!g.devId.empty()) s += "device=" + util::narrow(g.devId) + "\n";
     // 记住文件路径而不只是下标：移除一首歌之后，下标会指向别首
     std::string lp = (g.idx >= 0 && g.idx < (int)g.tracks.size())
                          ? util::normalizePath(g.tracks[g.idx].path)
@@ -199,23 +217,76 @@ void playAt(int i, bool autoplay) {
     g.status.clear();
     std::string err;
     if (!g.audio.open(g.tracks[i].path, &err)) {
-        g.status = err;
+        setStatus(err);
         g.playing = false;
         g.coverIdx = -2;
         loadCoverFor(i);
         return;
     }
     g.audio.setVolume(g.vol);
+    // 播放时 MF 给的是真实时长，顺手覆盖曲库里按码率估算的值
+    if (g.audio.dur() > 0) g.tracks[i].durationMs = (long long)(g.audio.dur() * 1000.0 + 0.5);
     if (autoplay) {
         g.audio.play();
         g.playing = true;
     } else {
         g.playing = false;
-    }
-    g.coverIdx = -2;
+    }    g.coverIdx = -2;
     loadCoverFor(i);
     g.view.keepVisible(i, (int)g.tracks.size());
     saveConfig();
+}
+
+// 重新枚举输出端点。配置里的设备可能已经拔掉，这时清掉选择、回到系统默认。
+void refreshDevices() {
+    auto list = au::listDevices();
+    g.devIds.clear();
+    g.devNames.clear();
+    g.devIndex = 0;
+    bool found = g.devId.empty();
+    for (auto& d : list) {
+        g.devIds.push_back(d.id);
+        g.devNames.push_back(util::narrow(d.name));
+        if (!d.id.empty() && d.id == g.devId) {
+            g.devIndex = (int)g.devIds.size() - 1;
+            found = true;
+        }
+    }
+    if (!found) {
+        g.devId.clear();
+        g.audio.setDevice(L"");
+    }
+}
+
+void selectDevice(int i) {
+    if (i < 0 || i >= (int)g.devIds.size()) return;
+    g.devIndex = i;
+    g.devId = g.devIds[i];
+    g.audio.setDevice(g.devId);
+    saveConfig();
+
+    std::string err;
+    bool ok = true;
+    if (g.idx >= 0 && g.idx < (int)g.tracks.size()) {
+        // 换端点要重开当前文件；位置和播放状态照旧
+        double at = g.audio.pos();
+        bool was = g.playing;
+        ok = g.audio.open(g.tracks[g.idx].path, &err);
+        if (ok) {
+            g.audio.setVolume(g.vol);
+            if (at > 0.3) g.audio.seek(at);
+            if (was) g.audio.play();
+            g.playing = was;
+        } else {
+            g.playing = false;
+        }
+    }
+    if (ok) setStatus("输出：" + g.devNames[i]);
+    else {
+        setStatus(err);
+        g.playing = false;
+    }
+    InvalidateRect(g.hwnd, nullptr, FALSE);
 }
 
 void nextTrack(bool fromEnd) {
@@ -454,6 +525,14 @@ void exitMini(HWND hwnd) {
 
 // ---------------- 每帧 ----------------
 
+// 控制行空间有限，只留设备名的前半段（"耳机 (EDIFIER...)" -> "耳机"）
+std::string shortDevName(const std::string& s) {
+    if (s == "跟随系统默认") return "系统默认";
+    size_t p = s.find(" (");
+    if (p != std::string::npos && p > 0) return s.substr(0, p);
+    return s;
+}
+
 ui::Model buildModel() {
     ui::Model m;
     m.tracks = &g.tracks;
@@ -468,6 +547,11 @@ ui::Model buildModel() {
     m.status = g.status;
     m.folders = &g.folders;
     m.excluded = &g.excluded;
+    m.devices = &g.devNames;
+    m.devIndex = g.devIndex;
+    m.deviceName = (g.devIndex >= 0 && g.devIndex < (int)g.devNames.size())
+                       ? shortDevName(g.devNames[g.devIndex])
+                       : "系统默认";
     return m;
 }
 
@@ -480,7 +564,7 @@ void applyPending() {
     if (g.view.takeVolume(&r)) {
         g.vol = r;
         g.audio.setVolume(r);
-        saveConfig();
+        // 拖动过程中只改内存，松手时再落盘（原来每个 mousemove 都写一次文件）
     }
 }
 
@@ -504,6 +588,8 @@ void handleActions() {
             case ui::A_REMOVE_TRACK: removeTrack(a.row); break;
             case ui::A_RESTORE_TRACK: restoreTrack(a.row); break;
             case ui::A_CLEAR_EXCLUDED: clearExcluded(); break;
+            case ui::A_DEV_PANEL: refreshDevices(); break;
+            case ui::A_DEV_SELECT: selectDevice(a.row); break;
             case ui::A_DRAG:
                 ReleaseCapture();
                 SendMessageW(g.hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
@@ -532,9 +618,35 @@ void tick() {
     // 一首放完：等缓冲也空了再切，免得尾巴被掐掉
     if (g.playing && g.audio.ended() && g.audio.drained()) nextTrack(true);
 
+    // 设备被拔掉 / 切到蓝牙 / 睡眠唤醒：重建链路，回到原来的位置
+    if (g.audio.deviceLost()) {
+        std::string err;
+        if (g.audio.recover(&err)) {
+            if (g.audio.deviceFallback()) {
+                g.audio.clearFallback();
+                g.devId.clear();
+                saveConfig();
+                setStatus("原输出设备已断开，已切回系统默认");
+            } else {
+                setStatus(g.audio.exclusiveActive() ? "音频设备已切换（独占）" : "音频设备已切换");
+            }
+            refreshDevices();
+        } else if (!err.empty()) {
+            setStatus(err);
+            g.playing = false;
+        }
+        InvalidateRect(g.hwnd, nullptr, FALSE);
+    }
+
     applyPending();
     handleActions();
     pollPickFolder();
+
+    // 状态提示 4 秒后自动消失，别一直盖着歌手名
+    if (!g.status.empty() && util::nowSec() - g.statusAt > 4.0) {
+        g.status.clear();
+        InvalidateRect(g.hwnd, nullptr, FALSE);
+    }
 
     bool animating = g.playing;
     if (!animating) {
@@ -594,6 +706,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONUP:
             g.view.mouseUp();
             applyPending();
+            saveConfig();  // 音量拖动结束才落盘
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         case WM_MOUSEWHEEL:
@@ -610,8 +723,32 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             switch (wp) {
                 case VK_SPACE: togglePlay(); break;
                 case 'M': g.mini ? exitMini(hwnd) : enterMini(hwnd); break;
+                case 'E': {
+                    // 独占 / 共享切换，立刻重开当前曲目，方便 A/B
+                    g.exclusive = !g.exclusive;
+                    g.audio.setExclusive(g.exclusive);
+                    saveConfig();
+                    if (g.idx >= 0 && g.idx < (int)g.tracks.size()) {
+                        double at = g.audio.pos();
+                        bool was = g.playing;
+                        std::string err;
+                        if (g.audio.open(g.tracks[g.idx].path, &err)) {
+                            g.audio.setVolume(g.vol);
+                            if (at > 0.3) g.audio.seek(at);
+                            if (was) g.audio.play();
+                            g.playing = was;
+                            setStatus(g.audio.exclusiveActive() ? "独占模式：绕过系统混音器"
+                                                              : "独占不可用，已回退共享");
+                        } else {
+                            setStatus(err);
+                            g.playing = false;
+                        }
+                    }
+                    break;
+                }
                 case VK_ESCAPE:
                     if (g.mini) exitMini(hwnd);
+                    else g.view.closeDevicePanel();
                     break;
                 case VK_LEFT: g.audio.seek(g.audio.pos() - 5); break;
                 case VK_RIGHT: g.audio.seek(g.audio.pos() + 5); break;
@@ -657,9 +794,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return 1;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
+    srand((unsigned)time(nullptr));  // 随机模式每次启动才有新序列
+
     g.dataDir = util::localAppData() + "\\Pulse";
     util::makeDirs(g.dataDir);
     loadConfig();
+    g.audio.setExclusive(g.exclusive);
+    g.audio.setDevice(g.devId);
+    g.audio.init();
+    refreshDevices();
 
     // 支持把文件夹拖到 exe 上（等价于「添加文件夹」）
     int argc = 0;
@@ -739,7 +882,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     }
 
     KillTimer(hwnd, TIMER_TICK);
-    g.audio.close();
+    g.audio.shutdown();
     saveConfig();
     CoUninitialize();
     return 0;
